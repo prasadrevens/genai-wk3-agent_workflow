@@ -20,6 +20,14 @@ const AGENT_META = {
   business: { label: "Business", icon: "💰" },
   rca: { label: "RCA", icon: "🎯" },
 };
+const VOICE_COMMANDS = [
+  "What is the incident status?",
+  "What is the root cause?",
+  "What is the business impact?",
+  "What is the confidence?",
+  "What is the recommendation?",
+  "Is approval ready?",
+];
 
 const initialPipeline = () =>
   Object.fromEntries(STAGES.map((stage) => [stage, "pending"]));
@@ -69,6 +77,45 @@ function dateTime(value) {
 
 function clamp(value) {
   return Math.max(0, Math.min(100, Number(value || 0)));
+}
+
+export function answer_voice_question(question, incident_state) {
+  const normalized = question.trim().toLowerCase();
+  const incident = incident_state.incident;
+  const rca = incident_state.rca;
+  const approvalStatus = incident_state.confirmationRequired
+    ? "Approval is recorded, but rollback still requires the explicit second confirmation gate."
+    : incident_state.decisionReady
+      ? "Approval controls are available. Any change must still be made through the gated UI controls."
+      : "Approval is not available yet. Triage must reach the human approval gate first.";
+
+  // TODO: ELEVENLABS_API_KEY integration belongs in a future voice I/O layer.
+  // Phase 2 intentionally returns text only and never triggers remediation.
+  if (!normalized) return "Enter a voice transcript to ask about the current incident.";
+  if (normalized.includes("status") || normalized.includes("healthy") || normalized.includes("degraded")) {
+    if (!incident) return "Incident telemetry is still loading.";
+    return `The incident is currently ${incident.status} with ${incident.severity} severity and ${incident.confidence} confidence.`;
+  }
+  if (normalized.includes("root") || normalized.includes("cause") || normalized.includes("rca")) {
+    return rca?.root_cause || "Root cause is not available yet. Run triage to synthesize RCA.";
+  }
+  if (normalized.includes("business") || normalized.includes("impact") || normalized.includes("revenue")) {
+    return rca?.business_impact || "Business impact is not available yet.";
+  }
+  if (normalized.includes("confidence")) {
+    return rca?.confidence
+      ? `The RCA confidence is ${rca.confidence}.`
+      : "Confidence is not available yet.";
+  }
+  if (normalized.includes("recommend") || normalized.includes("action") || normalized.includes("fix")) {
+    return rca?.gated_action
+      ? `Recommended action: ${rca.gated_action} This remains gated through the existing approval controls.`
+      : "No recommendation is available yet.";
+  }
+  if (normalized.includes("approval") || normalized.includes("approve") || normalized.includes("reject") || normalized.includes("rollback")) {
+    return approvalStatus;
+  }
+  return "I can answer questions about incident status, root cause, business impact, confidence, recommendation, and approval status.";
 }
 
 function ErrorNotice({ message, onDismiss }) {
@@ -184,6 +231,74 @@ function LiveTelemetryStatus({ lastChecked, polling, error }) {
       <span>Live telemetry</span>
       <span className="muted">{error ? "polling error" : label}</span>
     </div>
+  );
+}
+
+function VoiceIncidentCommander({
+  incident,
+  rca,
+  runState,
+  decisionReady,
+  confirmationRequired,
+  statusMessage,
+}) {
+  const [question, setQuestion] = useState("");
+  const [answer, setAnswer] = useState("Ask a question or choose a suggested command.");
+
+  const ask = (nextQuestion = question) => {
+    const incidentState = {
+      incident,
+      rca,
+      runState,
+      decisionReady,
+      confirmationRequired,
+      statusMessage,
+    };
+    setQuestion(nextQuestion);
+    setAnswer(answer_voice_question(nextQuestion, incidentState));
+  };
+
+  return (
+    <section className="panel voice-panel" aria-labelledby="voice-commander-title">
+      <div className="voice-head">
+        <div>
+          <h2 id="voice-commander-title">
+            <span className="ico">🎙️</span> Voice Incident Commander
+          </h2>
+          <p>Simulated voice transcript for incident questions.</p>
+        </div>
+        <span className="voice-badge">Phase 1 + 2</span>
+      </div>
+      <div className="voice-commands" aria-label="Suggested voice commands">
+        {VOICE_COMMANDS.map((command) => (
+          <button type="button" key={command} onClick={() => ask(command)}>
+            {command}
+          </button>
+        ))}
+      </div>
+      <form
+        className="voice-input-row"
+        onSubmit={(event) => {
+          event.preventDefault();
+          ask();
+        }}
+      >
+        <label htmlFor="voice-transcript">Voice transcript</label>
+        <input
+          id="voice-transcript"
+          type="text"
+          value={question}
+          onChange={(event) => setQuestion(event.target.value)}
+          placeholder="Ask about status, RCA, impact, confidence, recommendation, or approval"
+        />
+        <button type="submit" className="btn primary">
+          Ask
+        </button>
+      </form>
+      <div className="voice-answer" aria-live="polite">
+        {answer}
+      </div>
+    </section>
   );
 }
 
@@ -751,6 +866,14 @@ export default function SentinelDashboard() {
         />
         <LiveTelemetryStatus lastChecked={lastTelemetryCheck} polling={isPollingTelemetry} error={Boolean(errors.incident)} />
         <KpiGrid incident={incident} loading={loading.incident} />
+        <VoiceIncidentCommander
+          incident={incident}
+          rca={rca}
+          runState={runState}
+          decisionReady={decisionReady}
+          confirmationRequired={confirmationRequired}
+          statusMessage={statusMessage}
+        />
         {view === "eng" && <AgentPipeline pipeline={pipeline} />}
         <p className="view-note">{viewNote}</p>
         <div className="grid">
