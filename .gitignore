@@ -1,0 +1,27 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+*$py.class
+
+.env
+.venv/
+venv/
+env/
+
+logs/
+*.log
+
+MISC/
+Week 3 Project Handout_ Agentic AI Systems.docx
+~$*
+
+mini_shop_with_ui/__pycache__/
+mini_shop_with_ui/data/*.json
+mini_shop_with_ui/logs/
+
+sentinel-dashboard/node_modules/
+sentinel-dashboard/dist/
+sentinel-dashboard/.env
+sentinel-dashboard/.env.local
+
+tests/test_aiops_logging.py

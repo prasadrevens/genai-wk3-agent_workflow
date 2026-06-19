@@ -1,0 +1,5 @@
+streamlit>=1.40
+langgraph>=1.2
+langchain-openai>=1.0
+langchain-core>=1.0
+python-dotenv>=1.0
