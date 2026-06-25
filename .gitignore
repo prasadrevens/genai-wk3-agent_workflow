@@ -17,6 +17,7 @@ Week 3 Project Handout_ Agentic AI Systems.docx
 
 mini_shop_with_ui/__pycache__/
 mini_shop_with_ui/data/*.json
+mini_shop_with_ui/data/*.jsonl
 mini_shop_with_ui/logs/
 
 sentinel-dashboard/node_modules/

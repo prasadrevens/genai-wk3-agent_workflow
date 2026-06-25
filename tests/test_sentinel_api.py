@@ -1,10 +1,11 @@
 import unittest
 import os
 from pathlib import Path
+from unittest import mock
 
 from fastapi.testclient import TestClient
 
-from mini_shop_with_ui.app import app, save_state, get_state, TRIAGE_RUNS
+from mini_shop_with_ui.app import app, save_state, get_state, TRIAGE_RUNS, INCIDENT_MEMORY
 
 
 client = TestClient(app)
@@ -88,6 +89,7 @@ class SentinelApiTests(unittest.TestCase):
 
     def test_confirm_rollback_requires_approval_and_restores_good_deploy(self):
         TRIAGE_RUNS.clear()
+        INCIDENT_MEMORY.clear()
         state = get_state()
         original_mode = state["deploy_mode"]
         try:
@@ -113,10 +115,63 @@ class SentinelApiTests(unittest.TestCase):
             self.assertEqual(confirmed.status_code, 200)
             self.assertEqual(confirmed.json()["status"], "rollback_applied")
             self.assertEqual(get_state()["deploy_mode"], "good")
+            memory = client.get("/api/incident-memory")
+            self.assertEqual(memory.status_code, 200)
+            event_types = [record["event_type"] for record in memory.json()["records"]]
+            self.assertIn("decision_recorded", event_types)
+            self.assertIn("rollback_confirmed", event_types)
         finally:
             state = get_state()
             state["deploy_mode"] = original_mode
             save_state(state)
+            TRIAGE_RUNS.clear()
+            INCIDENT_MEMORY.clear()
+
+    def test_triage_run_records_memory_entry(self):
+        TRIAGE_RUNS.clear()
+        INCIDENT_MEMORY.clear()
+        try:
+            response = client.post("/api/triage/run")
+
+            self.assertEqual(response.status_code, 200)
+            memory = client.get("/api/incident-memory")
+            records = memory.json()["records"]
+            self.assertEqual(records[-1]["event_type"], "triage_created")
+            self.assertEqual(records[-1]["run_id"], response.json()["run_id"])
+        finally:
+            TRIAGE_RUNS.clear()
+            INCIDENT_MEMORY.clear()
+
+    def test_triage_stream_emits_timeline_and_evidence_events(self):
+        class FakeGraph:
+            def stream(self, *_args, **_kwargs):
+                yield {
+                    "metrics": {
+                        "timeline": [("metrics", "12:00:00", "high_checkout_latency")],
+                        "evidence_events": [
+                            {
+                                "agent": "metrics",
+                                "type": "tool_result",
+                                "summary": "Metrics tool returned high latency.",
+                                "raw": {"metric": "checkout.latency", "value": 900},
+                            }
+                        ],
+                    }
+                }
+
+        TRIAGE_RUNS.clear()
+        try:
+            run = client.post("/api/triage/run").json()
+            with mock.patch("mini_shop_with_ui.app.build_app", return_value=FakeGraph()):
+                response = client.get(f"/api/triage/stream?run_id={run['run_id']}")
+
+            self.assertEqual(response.status_code, 200)
+            body = response.text
+            self.assertIn('"message": "high_checkout_latency"', body)
+            self.assertIn("event: evidence", body)
+            self.assertIn('"type": "tool_result"', body)
+            self.assertIn('"metric": "checkout.latency"', body)
+        finally:
             TRIAGE_RUNS.clear()
 
 

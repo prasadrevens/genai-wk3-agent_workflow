@@ -204,18 +204,13 @@ function IncidentBanner({ incident, loading }) {
   );
 }
 
-function ActionBar({ runState, onRun, onReset, onReload, loading, resetting }) {
+function ActionBar({ runState, onRun, children }) {
   return (
     <div className="actions">
       <button type="button" className="btn primary" disabled={runState === "running"} onClick={onRun}>
         ▶ {runState === "running" ? "Running triage" : "Run triage"}
       </button>
-      <button type="button" className="btn" disabled={resetting} onClick={onReset}>
-        🔄 {resetting ? "Resetting UI" : "Reset UI"}
-      </button>
-      <button type="button" className="btn" disabled={loading} onClick={onReload}>
-        📂 {loading ? "Reloading telemetry" : "Reload telemetry"}
-      </button>
+      {children}
     </div>
   );
 }
@@ -244,8 +239,24 @@ function VoiceIncidentCommander({
 }) {
   const [question, setQuestion] = useState("");
   const [answer, setAnswer] = useState("Ask a question or choose a suggested command.");
+  const [voiceStatus, setVoiceStatus] = useState(null);
+  const [asking, setAsking] = useState(false);
 
-  const ask = (nextQuestion = question) => {
+  useEffect(() => {
+    let cancelled = false;
+    request("/api/voice/status")
+      .then((status) => {
+        if (!cancelled) setVoiceStatus(status);
+      })
+      .catch(() => {
+        if (!cancelled) setVoiceStatus({ audio_enabled: false, provider: "local" });
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  const ask = async (nextQuestion = question) => {
     const incidentState = {
       incident,
       rca,
@@ -255,8 +266,21 @@ function VoiceIncidentCommander({
       statusMessage,
     };
     setQuestion(nextQuestion);
-    setAnswer(answer_voice_question(nextQuestion, incidentState));
+    setAsking(true);
+    try {
+      const data = await request("/api/voice/ask", {
+        method: "POST",
+        body: JSON.stringify({ question: nextQuestion, include_audio: false }),
+      });
+      setAnswer(data.answer);
+    } catch {
+      setAnswer(answer_voice_question(nextQuestion, incidentState));
+    } finally {
+      setAsking(false);
+    }
   };
+
+  const badge = voiceStatus?.audio_enabled ? "ElevenLabs ready" : "Text mode";
 
   return (
     <section className="panel voice-panel" aria-labelledby="voice-commander-title">
@@ -265,9 +289,9 @@ function VoiceIncidentCommander({
           <h2 id="voice-commander-title">
             <span className="ico">🎙️</span> Voice Incident Commander
           </h2>
-          <p>Simulated voice transcript for incident questions.</p>
+          <p>Simulated transcript with backend voice guardrails.</p>
         </div>
-        <span className="voice-badge">Phase 1 + 2</span>
+        <span className="voice-badge">{badge}</span>
       </div>
       <div className="voice-commands" aria-label="Suggested voice commands">
         {VOICE_COMMANDS.map((command) => (
@@ -291,8 +315,8 @@ function VoiceIncidentCommander({
           onChange={(event) => setQuestion(event.target.value)}
           placeholder="Ask about status, RCA, impact, confidence, recommendation, or approval"
         />
-        <button type="submit" className="btn primary">
-          Ask
+        <button type="submit" className="btn primary" disabled={asking}>
+          {asking ? "Asking" : "Ask"}
         </button>
       </form>
       <div className="voice-answer" aria-live="polite">
@@ -467,13 +491,14 @@ function DependencyTree({ incident, loading }) {
 function BusinessMetrics({ incident, loading }) {
   if (loading || !incident) return <Panel title="Business metrics" icon="📊"><Skeleton lines={5} /></Panel>;
   const kpis = incident.kpis;
+  const paymentTone = kpis.payment_success_pct < 95 ? "crit" : "ok";
   return (
     <Panel title="Business metrics" icon="📊">
       <Stat label="Transactions" value={kpis.total_transactions} />
-      <Stat label="Payment success" value={pct(kpis.payment_success_pct)} tone="crit" />
+      <Stat label="Payment success" value={pct(kpis.payment_success_pct)} tone={paymentTone} />
       <Stat label="Failed transactions" value={kpis.failed_transactions} />
       <Stat label="Revenue (last 24h)" value={money(kpis.revenue_24h)} />
-      <Stat label="Estimated impact" value={money(kpis.estimated_impact)} tone="crit" />
+      <Stat label="Estimated impact" value={money(kpis.estimated_impact)} tone="accent" />
     </Panel>
   );
 }
@@ -522,6 +547,115 @@ function InvestigationTimeline({ timeline }) {
       </div>
     </div>
   );
+}
+
+function CommanderEvidenceTrail({ evidenceTrail }) {
+  const [isEvidenceTrailMaximized, setIsEvidenceTrailMaximized] = useState(false);
+
+  return (
+    <>
+      <div className="panel evidence-panel">
+        <div className="panel-title-row">
+          <h2>
+            <span className="ico">🧾</span> Commander Evidence Trail
+          </h2>
+          <button
+            className="btn panel-icon-btn"
+            type="button"
+            onClick={() => setIsEvidenceTrailMaximized(true)}
+            disabled={evidenceTrail.length === 0}
+            title="Maximize evidence trail"
+            aria-label="Maximize evidence trail"
+          >
+            ⛶ Maximize
+          </button>
+        </div>
+        {evidenceTrail.length === 0 ? (
+          <p className="empty">Run triage to stream raw evidence and extracted findings from each agent.</p>
+        ) : (
+          <EvidenceTrailCards evidenceTrail={evidenceTrail} />
+        )}
+      </div>
+      {isEvidenceTrailMaximized && (
+        <div className="evidence-modal" role="dialog" aria-modal="true" aria-labelledby="evidence-modal-title">
+          <div className="evidence-modal-shell">
+            <div className="evidence-modal-head">
+              <div>
+                <h2 id="evidence-modal-title">Commander Evidence Trail</h2>
+                <p>{evidenceTrail.length} evidence events captured during this triage run.</p>
+              </div>
+              <button className="btn" type="button" onClick={() => setIsEvidenceTrailMaximized(false)}>
+                Close
+              </button>
+            </div>
+            <div className="evidence-modal-body">
+              <EvidenceTrailCards evidenceTrail={evidenceTrail} />
+            </div>
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
+
+function EvidenceTrailCards({ evidenceTrail }) {
+  return (
+    <div className="evidence-list">
+      {evidenceTrail.map((item, index) => {
+        const agent = AGENT_META[item.agent] ? item.agent : "commander";
+        const meta = AGENT_META[agent];
+        const raw = item.raw ?? item.finding ?? item;
+        return (
+          <article className={`evidence-card ev-${agent}`} key={`${item.ts}-${item.agent}-${item.type}-${index}`}>
+            <div className="evidence-top">
+              <div className={`evidence-agent ag-${agent}`}>
+                {meta.icon} {meta.label}
+              </div>
+              <span className="evidence-type">{formatEvidenceType(item.type)}</span>
+            </div>
+            <p className="evidence-summary">{item.summary || item.message || "Evidence captured."}</p>
+            <div className="evidence-meta">
+              {item.tool && <span>tool <code>{item.tool}</code></span>}
+              {item.signal && <span>signal <code>{item.signal}</code></span>}
+              {item.confidence !== undefined && <span>confidence <b>{String(item.confidence)}</b></span>}
+              {item.alignment !== undefined && <span>aligned <b>{String(item.alignment)}</b></span>}
+              {item.revenue_impact !== undefined && <span>impact <b>{money(item.revenue_impact)}</b></span>}
+              {item.next_step && <span>next <code>{item.next_step}</code></span>}
+            </div>
+            {item.reasoning?.length > 0 && (
+              <ul className="evidence-reasons">
+                {item.reasoning.map((reason) => (
+                  <li key={reason}>{reason}</li>
+                ))}
+              </ul>
+            )}
+            {item.query && (
+              <details className="evidence-raw">
+                <summary>Query</summary>
+                <pre>{prettyJson(item.query)}</pre>
+              </details>
+            )}
+            <details className="evidence-raw">
+              <summary>Raw payload</summary>
+              <pre>{prettyJson(raw)}</pre>
+            </details>
+          </article>
+        );
+      })}
+    </div>
+  );
+}
+
+function formatEvidenceType(type = "evidence") {
+  return String(type).replaceAll("_", " ");
+}
+
+function prettyJson(value) {
+  try {
+    return JSON.stringify(value, null, 2);
+  } catch {
+    return String(value);
+  }
 }
 
 function RcaPanel({
@@ -625,6 +759,7 @@ export default function SentinelDashboard() {
   const [incident, setIncident] = useState(null);
   const [rca, setRca] = useState(null);
   const [timeline, setTimeline] = useState([]);
+  const [evidenceTrail, setEvidenceTrail] = useState([]);
   const [pipeline, setPipeline] = useState(initialPipeline);
   const [runState, setRunState] = useState("idle");
   const [runId, setRunId] = useState(null);
@@ -717,6 +852,11 @@ export default function SentinelDashboard() {
       }
     };
 
+    source.addEventListener("evidence", (event) => {
+      const item = JSON.parse(event.data);
+      setEvidenceTrail((current) => [...current, item]);
+    });
+
     source.addEventListener("done", (event) => {
       const payload = JSON.parse(event.data);
       setRunState("completed");
@@ -753,6 +893,7 @@ export default function SentinelDashboard() {
 
   const runTriage = async () => {
     setTimeline([]);
+    setEvidenceTrail([]);
     setPipeline({ ...initialPipeline(), commander: "active" });
     setRunState("running");
     setConfirmationRequired(false);
@@ -773,6 +914,7 @@ export default function SentinelDashboard() {
     try {
       await request("/api/triage/reset", { method: "POST" });
       setTimeline([]);
+      setEvidenceTrail([]);
       setPipeline(initialPipeline());
       setRunState("idle");
       setRunId(null);
@@ -859,12 +1001,9 @@ export default function SentinelDashboard() {
         <ActionBar
           runState={runState}
           onRun={runTriage}
-          onReset={resetUi}
-          onReload={reloadTelemetry}
-          loading={loading.telemetry}
-          resetting={loading.reset}
-        />
-        <LiveTelemetryStatus lastChecked={lastTelemetryCheck} polling={isPollingTelemetry} error={Boolean(errors.incident)} />
+        >
+          <LiveTelemetryStatus lastChecked={lastTelemetryCheck} polling={isPollingTelemetry} error={Boolean(errors.incident)} />
+        </ActionBar>
         <KpiGrid incident={incident} loading={loading.incident} />
         <VoiceIncidentCommander
           incident={incident}
@@ -883,7 +1022,12 @@ export default function SentinelDashboard() {
               <BusinessMetrics incident={incident} loading={loading.incident} />
             </div>
           )}
-          {view === "eng" && <InvestigationTimeline timeline={timeline} />}
+          {view === "eng" && (
+            <div className="middle-stack">
+              <InvestigationTimeline timeline={timeline} />
+              <CommanderEvidenceTrail evidenceTrail={evidenceTrail} />
+            </div>
+          )}
           <div className="rca-column">
             <ErrorNotice message={errors.rca} onDismiss={() => setError("rca", null)} />
             <RcaPanel

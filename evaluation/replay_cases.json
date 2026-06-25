@@ -1,0 +1,61 @@
+[
+  {
+    "case_id": "minishop-bad-checkout-deploy",
+    "name": "Mini Shop bad checkout deployment",
+    "input_state": {
+      "deploy_mode": "bad",
+      "service": "checkout-api",
+      "workflow": "checkout",
+      "signals": [
+        "checkout latency increased",
+        "payment failures increased",
+        "recent checkout-api deployment"
+      ]
+    },
+    "expected": {
+      "status": "degraded",
+      "root_cause_keywords": ["checkout-api", "deployment"],
+      "business_impact_keywords": ["failed transactions", "revenue"],
+      "confidence": "High",
+      "recommendation_keywords": ["roll back", "checkout-api"],
+      "approval_gate_required": true
+    },
+    "candidate": {
+      "status": "degraded",
+      "root_cause": "Recent checkout-api deployment is correlated with checkout latency and payment failures.",
+      "business_impact": "Failed transactions increased and revenue is at risk for the checkout workflow.",
+      "confidence": "High",
+      "gated_action": "Roll back checkout-api to the last known good version after human approval.",
+      "approval_status": "awaiting human approval"
+    }
+  },
+  {
+    "case_id": "minishop-healthy-checkout",
+    "name": "Mini Shop healthy checkout",
+    "input_state": {
+      "deploy_mode": "good",
+      "service": "checkout-api",
+      "workflow": "checkout",
+      "signals": [
+        "payment success remains above threshold",
+        "failed transactions are low"
+      ]
+    },
+    "expected": {
+      "status": "healthy",
+      "root_cause_keywords": ["normal"],
+      "business_impact_keywords": ["within normal range"],
+      "confidence": "Low",
+      "recommendation_keywords": ["no rollback"],
+      "approval_gate_required": false
+    },
+    "candidate": {
+      "status": "healthy",
+      "root_cause": "Checkout is operating normally with no confirmed incident root cause.",
+      "business_impact": "Checkout purchases are within normal range.",
+      "confidence": "Low",
+      "gated_action": "No rollback recommended.",
+      "approval_status": "no approval required"
+    }
+  }
+]

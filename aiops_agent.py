@@ -86,6 +86,7 @@ class IncidentState(TypedDict):
     impacted_services: list
     findings: Annotated[list, operator.add]      # technical specialist findings
     timeline: Annotated[list, operator.add]
+    evidence_events: Annotated[list, operator.add]
     wave: int
     next_step: str
     business_impact: dict
@@ -109,6 +110,15 @@ def build_app(backend: str = "local"):
     llm = ChatOpenAI(base_url=NEBIUS_BASE, model=CHAT_MODEL, temperature=0, api_key=api_key)
 
     # ---- intake: load dependency map up front ----------------------------- #
+    def evidence_event(agent, event_type, summary, **fields):
+        return {
+            "ts": _now(),
+            "agent": agent,
+            "type": event_type,
+            "summary": summary,
+            **fields,
+        }
+
     def intake(state: IncidentState) -> dict:
         alert = state["alert"]
         try:
@@ -116,10 +126,19 @@ def build_app(backend: str = "local"):
                                                       service=alert["service"])
         except ToolError:
             deps = {}
+        service_count = len(deps.get("services", []))
         return {"deps": deps, "wave": 0,
                 "impacted_services": deps.get("services", []),
                 "timeline": [("orchestrator", _now(),
-                              f"alert received; mapped {len(deps.get('services', []))} dependent services")]}
+                              f"alert received; mapped {service_count} dependent services")],
+                "evidence_events": [evidence_event(
+                    "commander",
+                    "tool_result",
+                    f"Loaded service dependency map with {service_count} dependent services.",
+                    tool="get_service_dependencies",
+                    query={"workflow": alert.get("workflow", ""), "service": alert.get("service", "")},
+                    raw=deps,
+                )]}
 
     # ---- commander: DECIDE the next technical agent (or stop) ------------- #
     CMD_SYSTEM = """You are the Incident Commander. You delegate to ONE technical specialist
@@ -135,7 +154,14 @@ Reply with ONLY one word: logs, metrics, trace, changes, or enough."""
         wave = state.get("wave", 0)
         if not remaining or wave >= WAVE_BUDGET:
             return {"next_step": "business", "wave": wave,
-                    "timeline": [("orchestrator", _now(), "technical investigation complete -> business impact")]}
+                    "timeline": [("orchestrator", _now(), "technical investigation complete -> business impact")],
+                    "evidence_events": [evidence_event(
+                        "commander",
+                        "delegation_decision",
+                        "Technical investigation complete; sending gathered findings to Business Impact.",
+                        finding_count=len(state.get("findings", [])),
+                        prior_findings=state.get("findings", []),
+                    )]}
         prior = "\n".join(f"- {f['agent']}: {f.get('signal', '')}"
                           for f in state.get("findings", [])) or "(none yet)"
         a = state["alert"]
@@ -146,9 +172,24 @@ Reply with ONLY one word: logs, metrics, trace, changes, or enough."""
         choice = next((c for c in remaining + ["enough"] if c in word), remaining[0])
         if choice == "enough":
             return {"next_step": "business", "wave": wave,
-                    "timeline": [("orchestrator", _now(), "enough evidence -> business impact")]}
+                    "timeline": [("orchestrator", _now(), "enough evidence -> business impact")],
+                    "evidence_events": [evidence_event(
+                        "commander",
+                        "delegation_decision",
+                        "Commander judged the technical evidence sufficient for business impact analysis.",
+                        next_step="business",
+                        prior_findings=state.get("findings", []),
+                    )]}
         return {"next_step": choice, "wave": wave + 1,
-                "timeline": [("orchestrator", _now(), f"delegating to {choice} agent")]}
+                "timeline": [("orchestrator", _now(), f"delegating to {choice} agent")],
+                "evidence_events": [evidence_event(
+                    "commander",
+                    "delegation_decision",
+                    f"Commander delegated to the {choice} agent based on available gaps.",
+                    next_step=choice,
+                    remaining_agents=remaining,
+                    prior_findings=state.get("findings", []),
+                )]}
 
     def cmd_router(state: IncidentState) -> str:
         return state["next_step"]
@@ -187,7 +228,27 @@ Do not invent facts. If the raw output is empty or ambiguous, lower confidence."
             finding = _summarize(agent, raw, available)
             tl = (agent, _now(), finding["signal"] if available
                   else f"tool failed -> degraded ({err})")
-            return {"findings": [finding], "timeline": [tl]}
+            evidence = [
+                evidence_event(
+                    agent,
+                    "tool_result",
+                    f"{agent} tool returned raw evidence." if available else f"{agent} tool failed; degraded evidence path.",
+                    tool=tool_name,
+                    query=kw(state),
+                    raw=raw if available else {"error": err},
+                    available=available,
+                ),
+                evidence_event(
+                    agent,
+                    "finding_created",
+                    finding.get("summary", ""),
+                    signal=finding.get("signal", ""),
+                    confidence=finding.get("confidence"),
+                    available=finding.get("available", available),
+                    finding=finding,
+                ),
+            ]
+            return {"findings": [finding], "timeline": [tl], "evidence_events": evidence}
         return node
 
     # ---- business impact agent (runs AFTER technical findings) ------------ #
@@ -221,7 +282,27 @@ because load generation inflates it — do not rely on it alone. Return ONLY JSO
         return {"business_impact": bi,
                 "timeline": [("business", _now(),
                               d.get("summary", "business impact assessed")[:70] if available
-                              else "business metrics unavailable -> degraded")]}
+                              else "business metrics unavailable -> degraded")],
+                "evidence_events": [
+                    evidence_event(
+                        "business",
+                        "tool_result",
+                        "Business metrics loaded for impact analysis." if available else "Business metrics unavailable.",
+                        tool="get_business_metrics",
+                        query={"service": state["alert"]["service"]},
+                        raw=bm,
+                        available=available,
+                    ),
+                    evidence_event(
+                        "business",
+                        "business_impact_created",
+                        bi.get("summary", ""),
+                        technical_findings=state["findings"],
+                        alignment=bi.get("aligned"),
+                        revenue_impact=bi.get("revenue_impact"),
+                        raw=bi,
+                    ),
+                ]}
 
     # ---- synthesize RCA + recommended runbook ----------------------------- #
     SYNTH_SYSTEM = """You merge technical findings + business impact into a root-cause analysis.
@@ -260,7 +341,20 @@ Do not call business_aligned false only because transaction_drop_percent is nega
         fix = state.get("proposed_fix") or rb.get("remediation") or rca.get("fix", "Roll back the most recent deploy.")
         return {"rca": rca, "proposed_fix": fix,
                 "recommended_actions": [fix] + ([f"runbook {rb.get('id', '')}: {rb.get('issue_type', rb.get('title', 'matched runbook'))}"] if rb else []),
-                "timeline": [("synthesize", _now(), rca.get("root_cause", "root cause drafted"))]}
+                "timeline": [("synthesize", _now(), rca.get("root_cause", "root cause drafted"))],
+                "evidence_events": [
+                    evidence_event(
+                        "rca",
+                        "rca_created",
+                        rca.get("root_cause", "Root cause drafted."),
+                        technical_findings=state["findings"],
+                        business_impact=bi,
+                        evidence=rca.get("evidence", []),
+                        proposed_fix=fix,
+                        runbook=rb,
+                        raw=rca,
+                    )
+                ]}
         
     # ---- deterministic confidence band ------------------------------------ #
     def score(state: IncidentState) -> dict:
@@ -305,7 +399,20 @@ Do not call business_aligned false only because transaction_drop_percent is nega
             "traces do not show the suspected bottleneck"]
         return {"confidence_band": band, "confidence_reasoning": reasoning,
                 "disconfirming_evidence": disconfirm,
-                "timeline": [("synthesize", _now(), f"confidence: {band}")]}
+                "timeline": [("synthesize", _now(), f"confidence: {band}")],
+                "evidence_events": [evidence_event(
+                    "rca",
+                    "confidence_scored",
+                    f"Confidence scored as {band}.",
+                    confidence=band,
+                    reasoning=reasoning,
+                    signal_count=n,
+                    tools_unavailable=tools_unavailable,
+                    change_time_correlated=change_corr,
+                    business_aligned=business_aligned,
+                    contradicting_evidence=rca.get("contradicting_evidence", []),
+                    disconfirming_evidence=disconfirm,
+                )]}
 
     # ---- human gate ------------------------------------------------------- #
     def human_gate(state: IncidentState) -> dict:

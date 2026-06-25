@@ -20,7 +20,10 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from aiops_agent import build_app
+from incident_memory import IncidentMemoryStore, record_from_run
 from langgraph.types import Command
+from mini_shop_with_ui.o11y import SplunkO11yEmitter
+from voice_assistant import ElevenLabsVoiceClient, answer_voice_question
 
 BASE_DIR = Path(__file__).resolve().parent
 DATA_DIR = BASE_DIR / "data"
@@ -38,12 +41,30 @@ BUSINESS_FILE = DATA_DIR / "business_metrics.json"
 DEPS_FILE = DATA_DIR / "service_dependencies.json"
 CHANGES_FILE = DATA_DIR / "changes.json"
 ALERT_FILE = DATA_DIR / "alert.json"
+INCIDENT_MEMORY_FILE = DATA_DIR / "incident_memory.jsonl"
+O11Y_EMITTER = SplunkO11yEmitter()
+INCIDENT_MEMORY = IncidentMemoryStore(INCIDENT_MEMORY_FILE)
 
 PRODUCTS = [
     {"id": "p-100", "name": "Nebula Hoodie", "price": 59.0},
     {"id": "p-200", "name": "Rocket Mug", "price": 18.0},
     {"id": "p-300", "name": "Moon Lamp", "price": 42.0},
 ]
+
+
+def load_env_file() -> None:
+    env_path = ROOT_DIR / ".env"
+    if not env_path.exists():
+        return
+    for line in env_path.read_text(encoding="utf-8").splitlines():
+        line = line.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, value = line.split("=", 1)
+        os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+
+
+load_env_file()
 
 
 def now_iso() -> str:
@@ -100,17 +121,20 @@ def record_metric(name: str, value: float, unit: str, service: str, **tags: Any)
     append_json(METRICS_FILE, {
         "ts": now_iso(), "metric": name, "value": value, "unit": unit, "service": service, "tags": tags,
     })
+    O11Y_EMITTER.emit_metric(name=name, value=value, unit=unit, service=service, tags=tags)
 
 
 def record_trace(endpoint: str, spans: List[Dict[str, Any]], status: str, trace_id: Optional[str] = None) -> None:
+    trace_id = trace_id or str(uuid.uuid4())
     append_json(TRACES_FILE, {
-        "trace_id": trace_id or str(uuid.uuid4()),
+        "trace_id": trace_id,
         "ts": now_iso(),
         "endpoint": endpoint,
         "status": status,
         "total_duration_ms": sum(span["duration_ms"] for span in spans),
         "spans": spans,
     })
+    O11Y_EMITTER.emit_trace(endpoint=endpoint, spans=spans, status=status, trace_id=trace_id)
 
 
 def refresh_business_metrics() -> Dict[str, Any]:
@@ -222,6 +246,11 @@ class CheckoutRequest(BaseModel):
 
 class TriageDecisionRequest(BaseModel):
     decision: Literal["approve", "reject"]
+
+
+class VoiceAskRequest(BaseModel):
+    question: str
+    include_audio: bool = False
 
 
 def _latest_run() -> Optional[Dict[str, Any]]:
@@ -678,6 +707,22 @@ def telemetry() -> Dict[str, Any]:
     }
 
 
+@app.get("/admin/o11y-status")
+def o11y_status() -> Dict[str, Any]:
+    return O11Y_EMITTER.status()
+
+
+@app.post("/admin/o11y-test")
+def o11y_test() -> Dict[str, Any]:
+    record_metric("impactiq.o11y.test", 1, "count", "checkout-api", source="manual-test")
+    record_trace(
+        "/admin/o11y-test",
+        [{"service": "checkout-api", "operation": "manual o11y test", "duration_ms": 10}],
+        "ok",
+    )
+    return O11Y_EMITTER.status()
+
+
 @app.get("/api/incident")
 def api_incident() -> Dict[str, Any]:
     # TODO: replace file reads with the production telemetry provider when available.
@@ -699,10 +744,13 @@ def api_triage_run() -> Dict[str, str]:
         "created_at": now_iso(),
         "status": "created",
         "timeline": [],
+        "evidence": [],
         "pause": None,
         "final": None,
         "decision_status": None,
     }
+    alert = read_json(ALERT_FILE, {}) or _incident_payload()
+    INCIDENT_MEMORY.append(record_from_run("triage_created", TRIAGE_RUNS[run_id], alert))
     return {"run_id": run_id}
 
 
@@ -734,9 +782,27 @@ def api_triage_stream(run_id: str) -> StreamingResponse:
                         "message": "Root cause synthesized; human approval required",
                         "stage_done": "rca",
                     })
+                    gate_event = {
+                        "ts": datetime.now().strftime("%H:%M:%S"),
+                        "agent": "rca",
+                        "type": "human_gate_reached",
+                        "summary": "Root cause synthesized; human approval required.",
+                        "raw": pause,
+                    }
+                    run.setdefault("evidence", []).append(gate_event)
+                    yield _sse(gate_event, event="evidence")
                     yield _sse({"status": "awaiting_decision", "rca": pause}, event="done")
                     return
                 for _node, upd in chunk.items():
+                    if isinstance(upd, dict) and upd.get("evidence_events"):
+                        for evidence in upd["evidence_events"]:
+                            event = {
+                                "ts": evidence.get("ts") or datetime.now().strftime("%H:%M:%S"),
+                                "agent": _stage_name(evidence.get("agent", "commander")),
+                                **{k: v for k, v in evidence.items() if k not in {"ts", "agent"}},
+                            }
+                            run.setdefault("evidence", []).append(event)
+                            yield _sse(event, event="evidence")
                     if isinstance(upd, dict) and upd.get("timeline"):
                         for agent, ts, message in upd["timeline"]:
                             event = {
@@ -782,6 +848,9 @@ def api_triage_decision(req: TriageDecisionRequest) -> Dict[str, Any]:
 
     if req.decision == "approve":
         run["status"] = "pending_rollback_confirmation"
+        INCIDENT_MEMORY.append(
+            record_from_run("decision_recorded", run, read_json(ALERT_FILE, {}) or _incident_payload())
+        )
         return {
             "status": "pending_confirmation",
             "message": "Approval recorded. Confirm rollback explicitly before any production change is attempted.",
@@ -809,6 +878,9 @@ def api_triage_decision(req: TriageDecisionRequest) -> Dict[str, Any]:
         run["decision_error"] = str(exc)
     run["status"] = "rejected"
     run["final"] = final
+    INCIDENT_MEMORY.append(
+        record_from_run("decision_recorded", run, read_json(ALERT_FILE, {}) or _incident_payload(), outcome=final)
+    )
     return {"status": "rejected", "message": final}
 
 
@@ -833,6 +905,15 @@ def api_triage_confirm_rollback() -> Dict[str, Any]:
         "message": "rollback applied after second human confirmation",
         "stage_done": "rca",
     })
+    INCIDENT_MEMORY.append(
+        record_from_run(
+            "rollback_confirmed",
+            run,
+            read_json(ALERT_FILE, {}) or _incident_payload(),
+            rollback_status=rollback.get("status"),
+            confirmed_by=run["confirmed_by"],
+        )
+    )
     return {
         "status": "rollback_applied",
         "message": "Rollback applied after explicit human confirmation.",
@@ -843,9 +924,45 @@ def api_triage_confirm_rollback() -> Dict[str, Any]:
     }
 
 
+@app.get("/api/incident-memory")
+def api_incident_memory(limit: int = 100) -> Dict[str, Any]:
+    return {"records": INCIDENT_MEMORY.list_records(limit=max(1, min(limit, 500)))}
+
+
+@app.get("/api/voice/status")
+def api_voice_status() -> Dict[str, Any]:
+    return ElevenLabsVoiceClient().status()
+
+
+@app.post("/api/voice/ask")
+def api_voice_ask(req: VoiceAskRequest) -> Dict[str, Any]:
+    latest = _latest_run() or {}
+    incident_state = {
+        "incident": _incident_payload(),
+        "rca": _rca_payload(),
+        "run_state": latest.get("status"),
+        "decision_ready": latest.get("status") == "awaiting_decision",
+        "confirmation_required": latest.get("status") == "pending_rollback_confirmation",
+    }
+    answer = answer_voice_question(req.question, incident_state)
+    audio = {"enabled": False, "status": "not_requested", "audio_base64": None, "content_type": None, "error_message": None}
+    if req.include_audio:
+        audio = ElevenLabsVoiceClient().synthesize(answer).to_dict()
+    return {
+        "question": req.question,
+        "answer": answer,
+        "audio": audio,
+        "guardrails": {
+            "read_only": True,
+            "approval_gated": True,
+            "remediation_triggered": False,
+        },
+    }
+
+
 @app.post("/admin/reset")
 def reset() -> Dict[str, Any]:
-    for path in [STATE_FILE, JSON_LOG_FILE, METRICS_FILE, TRACES_FILE, BUSINESS_FILE, CHANGES_FILE, ALERT_FILE, APP_LOG_FILE]:
+    for path in [STATE_FILE, JSON_LOG_FILE, METRICS_FILE, TRACES_FILE, BUSINESS_FILE, CHANGES_FILE, ALERT_FILE, APP_LOG_FILE, INCIDENT_MEMORY_FILE]:
         if path.exists():
             path.unlink()
     get_state()

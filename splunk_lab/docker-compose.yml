@@ -1,0 +1,27 @@
+services:
+  splunk:
+    image: splunk/splunk:9.4
+    platform: linux/amd64
+    container_name: impactiq-splunk-lab
+    environment:
+      SPLUNK_START_ARGS: "--accept-license"
+      SPLUNK_PASSWORD: "${SPLUNK_PASSWORD:-ImpactIQ-lab-12345}"
+      SPLUNK_HEC_ENABLE: "true"
+      SPLUNK_HEC_TOKEN: "${SPLUNK_HEC_TOKEN:-impactiq-hec-token}"
+      SPLUNK_APPS_URL: ""
+    ports:
+      - "18000:8000"
+      - "18089:8089"
+      - "18088:8088"
+    volumes:
+      - splunk_etc:/opt/splunk/etc
+      - splunk_var:/opt/splunk/var
+    healthcheck:
+      test: ["CMD", "curl", "-k", "-u", "admin:${SPLUNK_PASSWORD:-ImpactIQ-lab-12345}", "https://localhost:8089/services/server/info?output_mode=json"]
+      interval: 20s
+      timeout: 10s
+      retries: 30
+
+volumes:
+  splunk_etc:
+  splunk_var:
